@@ -1,309 +1,360 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 import re
+from datetime import datetime
 from io import BytesIO
-from datetime import datetime, date
 
 st.set_page_config(page_title="Gate Workload • EasyMag", layout="wide")
 
-# ----------------------------
-# Helpers
-# ----------------------------
-MARKER_PATTERN = re.compile(r"Numero\s+di\s+Operazioni", re.IGNORECASE)
+# -------------------------
+# Normalization helpers
+# -------------------------
+def norm_giro(x) -> str:
+    """Normalize Giro keys for robust matching (no Excel edits needed)."""
+    if pd.isna(x):
+        return ""
+    s = str(x)
+    s = s.replace("\u00A0", " ").strip()          # NBSP -> space, trim
+    s = re.sub(r"\s+", " ", s)                    # collapse internal spaces
+    s = s.replace("–", "-").replace("—", "-").replace("_", "-")
+    s = s.upper()
+    return s
 
-def _find_marker_row(xlsx_bytes: bytes) -> int | None:
-    """Return 0-based row index of marker in column A, or None."""
-    import openpyxl
-    wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), data_only=True, read_only=True)
-    ws = wb.active
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=1, values_only=True)):
-        v = row[0]
-        if isinstance(v, str) and MARKER_PATTERN.search(v):
+def safe_to_datetime(x):
+    try:
+        return pd.to_datetime(x, dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def find_marker_row(raw: pd.DataFrame) -> int | None:
+    """Find first row containing '(*) Numero di Operazioni' (case-insensitive)."""
+    pat = re.compile(r"\(\*\)\s*numero\s+di\s+operazioni", re.IGNORECASE)
+    for i in range(len(raw)):
+        row = raw.iloc[i].astype(str).fillna("")
+        if row.str.contains(pat).any():
             return i
     return None
 
-def read_easymag_pivot(xlsx_bytes: bytes) -> pd.DataFrame:
+def find_header_row(raw: pd.DataFrame) -> int:
+    """Find header row containing 'Giro' and 'Data' or 'Giro/Data'."""
+    for i in range(min(80, len(raw))):
+        row = raw.iloc[i].astype(str).fillna("")
+        joined = " | ".join(row.tolist()).lower()
+        if "giro" in joined and ("data" in joined or "giro/data" in joined):
+            return i
+    # fallback: first non-empty row
+    for i in range(len(raw)):
+        if raw.iloc[i].notna().any():
+            return i
+    return 0
+
+def parse_easymag_pivot(file_bytes: bytes) -> pd.DataFrame:
     """
-    Reads an EasyMag 'Statistica' export shaped like:
-    Row1: Giro/Data | <Giro1> | <Giro2> | ...
-    Rows: date values
-    Row: Tot:
-    Then a marker line "(*) Numero di Operazioni" and the table repeats.
-    Returns LONG df with columns: Data (datetime or NaT), Giro (str), Valore (float).
+    Parse EasyMag pivot-like export (dates down, giri across).
+    Returns long df: Data, Giro, Valore, Giro_raw
     """
-    marker0 = _find_marker_row(xlsx_bytes)
-    # marker0 is 0-based index, pandas uses nrows count
-    nrows = marker0 if marker0 is not None else None
+    raw = pd.read_excel(BytesIO(file_bytes), header=None, engine="openpyxl")
 
-    df = pd.read_excel(BytesIO(xlsx_bytes), header=0, nrows=nrows)
-    if df.empty:
-        return pd.DataFrame(columns=["Data", "Giro", "Valore"])
+    marker = find_marker_row(raw)
+    if marker is not None and marker > 0:
+        raw = raw.iloc[:marker].copy()
 
-    first_col = df.columns[0]
-    # drop fully empty rows
-    df = df.dropna(how="all")
-    # Ensure giro columns are strings
-    df.columns = [str(c).strip() for c in df.columns]
+    hdr = find_header_row(raw)
+    header_vals = raw.iloc[hdr].tolist()
+    df = raw.iloc[hdr+1:].copy()
+    df.columns = header_vals
 
-    # Melt pivot to long
-    long = df.melt(id_vars=[first_col], var_name="Giro", value_name="Valore")
-    long.rename(columns={first_col: "DataRaw"}, inplace=True)
+    df = df.dropna(axis=1, how="all")
 
-    # Clean Giro
-    long["Giro"] = long["Giro"].astype(str).str.strip()
+    date_col = df.columns[0]
+    df = df.rename(columns={date_col: "Data"})
+    df["Data_str"] = df["Data"].astype(str).fillna("")
 
-    # Parse dates; keep Tot row as NaT (but will be excluded from daily trend)
-    def parse_date(x):
-        if isinstance(x, str) and x.strip().lower().startswith("tot"):
-            return pd.NaT
-        return pd.to_datetime(x, errors="coerce")
-    long["Data"] = long["DataRaw"].apply(parse_date)
-    long.drop(columns=["DataRaw"], inplace=True)
+    # remove Tot: rows and empty rows
+    df = df[~df["Data_str"].str.contains(r"^\s*Tot\s*:", case=False, regex=True)]
+    df = df[df["Data_str"].str.strip() != ""]
 
-    # Coerce numeric
-    long["Valore"] = pd.to_numeric(long["Valore"], errors="coerce").fillna(0)
+    # parse dates
+    df["Data"] = df["Data"].apply(safe_to_datetime)
+    if df["Data"].isna().all():
+        extracted = df["Data_str"].str.extract(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})", expand=False)
+        df["Data"] = extracted.apply(safe_to_datetime)
 
-    # Drop blank giro labels if any
-    long = long[long["Giro"].ne("")].copy()
+    value_cols = [c for c in df.columns if c not in ["Data", "Data_str"]]
 
-    return long[["Data", "Giro", "Valore"]]
+    long = df.melt(id_vars=["Data"], value_vars=value_cols, var_name="Giro", value_name="Valore")
+    long["Giro_raw"] = long["Giro"]
+    long["Giro"] = long["Giro"].apply(norm_giro)
+    long["Valore"] = pd.to_numeric(long["Valore"], errors="coerce").fillna(0.0)
 
-def read_gate_map(gate_file: BytesIO) -> pd.DataFrame:
-    g = pd.read_excel(gate_file)
-    # In your file: Giro is column B, Gate is column J; but we rely on headers if present.
-    # If headers differ, fallback to positional.
-    cols = {c.lower(): c for c in g.columns}
-    giro_col = cols.get("giro", g.columns[1] if len(g.columns) > 1 else g.columns[0])
-    gate_col = cols.get("gate", g.columns[9] if len(g.columns) > 9 else g.columns[-1])
+    long = long[(long["Giro"] != "") & (long["Valore"] != 0)]
+    long = long.dropna(subset=["Data"])
+    return long[["Data", "Giro", "Valore", "Giro_raw"]]
 
-    out = g[[giro_col, gate_col]].copy()
-    out.columns = ["Giro", "Gate"]
-    out["Giro"] = out["Giro"].astype(str).str.strip()
-    # Gate may be numeric floats like 4.0 -> convert to int-like string for display
-    out["Gate"] = out["Gate"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    out.loc[out["Gate"].isin(["nan", "None", ""]), "Gate"] = "NON_ASSEGNATO"
-    return out.dropna(subset=["Giro"])
-
-def label_metric(file_name: str, total_value: float) -> str:
-    n = (file_name or "").lower()
-    if "righe" in n or "prelev" in n:
+def infer_metric_label(filename: str, total_val: float) -> str:
+    """
+    Infer whether file is Righe or Colli from filename.
+    If unknown, caller may still map it manually in UI.
+    """
+    name = (filename or "").lower()
+    if any(k in name for k in ["riga", "righe", "preliev"]):
         return "Righe"
-    if "colli" in n:
+    if any(k in name for k in ["collo", "colli"]):
         return "Colli"
-    # fallback will be decided later comparing totals
+    # ambiguous
     return "Auto"
 
-def build_fact(long_df: pd.DataFrame, gate_map: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+def build_gate_map(gate_file_bytes: bytes) -> pd.DataFrame:
+    """
+    Read GATE.xlsx expecting:
+      - Giro in colonna B
+      - Gate in colonna J
+    """
+    gate_raw = pd.read_excel(BytesIO(gate_file_bytes), engine="openpyxl")
+    # Defensive: use positional columns if present
+    if gate_raw.shape[1] >= 10:
+        giro_col = gate_raw.columns[1]   # B
+        gate_col = gate_raw.columns[9]   # J
+    else:
+        # fallback: try by name
+        candidates_giro = [c for c in gate_raw.columns if str(c).strip().lower() in ["giro", "giri", "tour"]]
+        candidates_gate = [c for c in gate_raw.columns if "gate" in str(c).strip().lower()]
+        giro_col = candidates_giro[0] if candidates_giro else gate_raw.columns[0]
+        gate_col = candidates_gate[0] if candidates_gate else gate_raw.columns[-1]
+
+    gate_map = gate_raw[[giro_col, gate_col]].copy()
+    gate_map.columns = ["Giro", "Gate"]
+
+    gate_map["Giro_raw"] = gate_map["Giro"]
+    gate_map["Giro"] = gate_map["Giro"].apply(norm_giro)
+    gate_map["Gate"] = gate_map["Gate"].astype(str).replace({"nan": ""}).str.strip()
+
+    gate_map = gate_map[gate_map["Giro"] != ""].copy()
+    gate_map = gate_map.drop_duplicates(subset=["Giro"], keep="last")
+    return gate_map[["Giro", "Gate", "Giro_raw"]]
+
+def merge_with_gate(long_df: pd.DataFrame, gate_map: pd.DataFrame, metric: str) -> pd.DataFrame:
     fact = long_df.copy()
-    fact["Giro"] = fact["Giro"].astype(str).str.strip()
-    fact["Metrica"] = metric_name
-    fact = fact.merge(gate_map, on="Giro", how="left")
-    fact["Gate"] = fact["Gate"].fillna("NON_ASSEGNATO")
+    fact["Metrica"] = metric
+    fact = fact.merge(gate_map[["Giro", "Gate"]], on="Giro", how="left")
+    fact["Gate"] = fact["Gate"].fillna("NON ASSEGNATO")
     return fact
 
-def safe_date_bounds(df: pd.DataFrame):
-    d = df["Data"].dropna()
-    if d.empty:
-        today = pd.Timestamp(date.today())
-        return today, today
-    return d.min().normalize(), d.max().normalize()
-
-# ----------------------------
+# -------------------------
 # UI
-# ----------------------------
+# -------------------------
 st.title("Gate Workload • EasyMag")
 
-left = st.sidebar
-left.header("1) Caricamento file")
+st.sidebar.header("1) Caricamento file")
+gate_file = st.sidebar.file_uploader("GATE.xlsx (obbligatorio)", type=["xlsx"], key="gate")
 
-gate_file = left.file_uploader("GATE.xlsx (mappa Giro → Gate)", type=["xlsx"], key="gate")
-f1 = left.file_uploader("Export EasyMag #1 (righe o colli)", type=["xlsx"], key="f1")
-f2 = left.file_uploader("Export EasyMag #2 (righe o colli)", type=["xlsx"], key="f2")
+st.sidebar.caption("Gli export EasyMag sono opzionali: puoi caricare solo Righe, solo Colli, oppure entrambi.")
+file1 = st.sidebar.file_uploader("Export EasyMag #1 (righe o colli) (opzionale)", type=["xlsx"], key="f1")
+file2 = st.sidebar.file_uploader("Export EasyMag #2 (righe o colli) (opzionale)", type=["xlsx"], key="f2")
 
-left.header("2) Impostazioni")
-top_n = left.slider("Top N giri (vista dettaglio)", 5, 50, 15)
-thr_gate = left.slider("Alert: Gate > X% del totale", 5, 90, 40)
-thr_ratio = left.slider("Alert: Colli/100 righe > soglia", 10, 500, 120)
-
-if not (gate_file and f1 and f2):
-    st.info("Carica **GATE.xlsx** e i **due export EasyMag** per vedere la dashboard.")
+if gate_file is None:
+    st.info("Carica prima **GATE.xlsx** per iniziare.")
     st.stop()
 
-gate_map = read_gate_map(gate_file)
+gate_map = build_gate_map(gate_file.getvalue())
 
-# Read + truncate + pivot->long
-long1 = read_easymag_pivot(f1.getvalue())
-long2 = read_easymag_pivot(f2.getvalue())
+# Parse available exports
+exports = []
+for f in [file1, file2]:
+    if f is None:
+        continue
+    long_df = parse_easymag_pivot(f.getvalue())
+    label = infer_metric_label(getattr(f, "name", ""), float(long_df["Valore"].sum()))
+    exports.append({"file": f, "long": long_df, "label": label})
 
-tot1 = float(long1.loc[long1["Data"].notna(), "Valore"].sum())
-tot2 = float(long2.loc[long2["Data"].notna(), "Valore"].sum())
+if len(exports) == 0:
+    st.warning("Hai caricato solo GATE.xlsx. Carica almeno **un** export EasyMag (righe o colli) per vedere i grafici.")
+    # Mostra comunque diagnostica mapping
+    st.subheader("Diagnostica mapping GATE")
+    st.dataframe(gate_map.head(50))
+    st.stop()
 
-lab1 = label_metric(f1.name, tot1)
-lab2 = label_metric(f2.name, tot2)
+# If ambiguous, let user assign metrics
+st.sidebar.header("2) Assegnazione file (se serve)")
+for i, ex in enumerate(exports, start=1):
+    default = ex["label"]
+    if default == "Auto":
+        default = "Righe"
+    ex["metric"] = st.sidebar.selectbox(
+        f"File {i}: {getattr(ex['file'], 'name', 'export')}",
+        options=["Righe", "Colli"],
+        index=0 if default == "Righe" else 1,
+        key=f"metric_{i}"
+    )
 
-# If both Auto, guess: larger total = Righe
-if lab1 == "Auto" and lab2 == "Auto":
-    if tot1 >= tot2:
-        lab1, lab2 = "Righe", "Colli"
-    else:
-        lab1, lab2 = "Colli", "Righe"
-# If one Auto, assign the other
-if lab1 == "Auto" and lab2 != "Auto":
-    lab1 = "Colli" if lab2 == "Righe" else "Righe"
-if lab2 == "Auto" and lab1 != "Auto":
-    lab2 = "Colli" if lab1 == "Righe" else "Righe"
+# If user accidentally assigns both as same metric, allow but warn and keep the latest one
+metrics_assigned = [ex["metric"] for ex in exports]
+if len(metrics_assigned) == 2 and metrics_assigned[0] == metrics_assigned[1]:
+    st.sidebar.warning("Hai assegnato entrambi i file alla stessa metrica. Verranno sommati come un unico dataset.")
 
-fact = pd.concat([
-    build_fact(long1, gate_map, lab1),
-    build_fact(long2, gate_map, lab2),
-], ignore_index=True)
+# Build unified fact
+facts = [merge_with_gate(ex["long"], gate_map, ex["metric"]) for ex in exports]
+fact = pd.concat(facts, ignore_index=True)
 
-# Date filter
-dmin, dmax = safe_date_bounds(fact)
-colA, colB, colC = st.columns([2,2,2])
-with colA:
-    metric_view = st.radio("Metrica", ["Righe", "Colli"], horizontal=True)
-with colB:
-    start = st.date_input("Dal", value=dmin.date(), min_value=dmin.date(), max_value=dmax.date())
-with colC:
-    end = st.date_input("Al", value=dmax.date(), min_value=dmin.date(), max_value=dmax.date())
+# -------------------------
+# Diagnostics for "NON ASSEGNATO"
+# -------------------------
+with st.expander("🔎 Diagnostica: perché vedo 'NON ASSEGNATO'? (click)"):
+    st.write("L'app normalizza automaticamente i giri (spazi, maiuscole, numeri/testo). 'NON ASSEGNATO' resta solo se il giro non è presente nel mapping.")
+    assigned = fact[fact["Gate"] != "NON ASSEGNATO"]["Valore"].sum()
+    unassigned = fact[fact["Gate"] == "NON ASSEGNATO"]["Valore"].sum()
+    total = fact["Valore"].sum()
+    if total > 0:
+        st.metric("Quota NON ASSEGNATO", f"{unassigned/total:.1%}")
+    # list missing giri
+    missing_giri = fact.loc[fact["Gate"] == "NON ASSEGNATO", ["Giro_raw", "Giro"]].drop_duplicates().sort_values("Giro")
+    st.write("Giri presenti negli export ma senza Gate nel mapping:")
+    st.dataframe(missing_giri, use_container_width=True)
 
-start_ts = pd.Timestamp(start)
-end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+# -------------------------
+# Filters
+# -------------------------
+st.sidebar.header("3) Filtri")
+min_d = fact["Data"].min().date()
+max_d = fact["Data"].max().date()
+start_d, end_d = st.sidebar.date_input("Periodo", value=(min_d, max_d), min_value=min_d, max_value=max_d)
 
-# Filters Gate/Giri
-all_gates = sorted(fact["Gate"].dropna().unique().tolist())
-all_giri = sorted(fact["Giro"].dropna().unique().tolist())
+if isinstance(start_d, (list, tuple)):
+    # streamlit may return tuple
+    start_d, end_d = start_d
+start_dt = pd.to_datetime(start_d)
+end_dt = pd.to_datetime(end_d) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
-with st.sidebar:
-    st.header("3) Filtri")
-    sel_gates = st.multiselect("Solo Gate selezionati", all_gates, default=all_gates)
-    sel_giri = st.multiselect("Solo Giri selezionati", all_giri, default=all_giri)
+fact_f = fact[(fact["Data"] >= start_dt) & (fact["Data"] <= end_dt)].copy()
 
-f = fact[
-    (fact["Metrica"] == metric_view) &
-    (fact["Giro"].isin(sel_giri)) &
-    (fact["Gate"].isin(sel_gates)) &
-    (fact["Data"].between(start_ts, end_ts) | fact["Data"].isna())  # Tot rows have NaT; we keep but won't use for trends
-].copy()
+all_gates = sorted(fact_f["Gate"].unique().tolist())
+sel_gates = st.sidebar.multiselect("Solo Gate selezionati", options=all_gates, default=all_gates)
 
-# Aggregate by Gate
-gate_tot = (
-    f[f["Data"].notna()]
-    .groupby("Gate", as_index=False)["Valore"].sum()
-    .sort_values("Valore", ascending=False)
-)
+fact_f = fact_f[fact_f["Gate"].isin(sel_gates)]
 
-total = gate_tot["Valore"].sum()
-gate_tot["Perc"] = np.where(total > 0, gate_tot["Valore"] / total * 100, 0)
+all_giri = sorted(fact_f["Giro"].unique().tolist())
+sel_giri = st.sidebar.multiselect("Solo Giri selezionati", options=all_giri, default=all_giri)
 
-# ----------------------------
-# Main dashboard: pie + stacked bars
-# ----------------------------
-c1, c2 = st.columns([1, 2], gap="large")
+fact_f = fact_f[fact_f["Giro"].isin(sel_giri)]
+
+# Settings
+topn = st.sidebar.slider("Top N giri (vista dettaglio)", 5, 50, 15)
+alert_gate_pct = st.sidebar.slider("Alert: Gate > X% del totale", 5, 90, 40)
+alert_ratio = st.sidebar.slider("Alert: Colli/100 righe > soglia", 10, 300, 120)
+
+# Metric selector based on available
+available_metrics = sorted(fact_f["Metrica"].unique().tolist())
+metric_for_pie = st.selectbox("Metrica per grafici principali", options=available_metrics, index=0)
+
+# -------------------------
+# Dashboard layout
+# -------------------------
+c1, c2, c3 = st.columns([1, 1, 1])
+
+total_val = fact_f.loc[fact_f["Metrica"] == metric_for_pie, "Valore"].sum()
+total_rows = fact_f.loc[fact_f["Metrica"] == "Righe", "Valore"].sum() if "Righe" in available_metrics else 0.0
+total_colli = fact_f.loc[fact_f["Metrica"] == "Colli", "Valore"].sum() if "Colli" in available_metrics else 0.0
 
 with c1:
-    st.subheader("Peso Gate sul totale")
-    import plotly.express as px
-    fig = px.pie(gate_tot, names="Gate", values="Valore", hole=0.35)
-    st.plotly_chart(fig, use_container_width=True)
-
+    st.metric(f"Totale {metric_for_pie}", f"{total_val:,.0f}".replace(",", "."))
 with c2:
-    st.subheader("Gate (stacked) → dettaglio giri")
-    # Build stacked: top giri per gate
-    d = (
-        f[f["Data"].notna()]
-        .groupby(["Gate", "Giro"], as_index=False)["Valore"].sum()
-    )
-    # keep top giri overall to reduce clutter
-    top_giri_overall = (
-        d.groupby("Giro")["Valore"].sum().sort_values(ascending=False).head(25).index.tolist()
-    )
-    d_plot = d[d["Giro"].isin(top_giri_overall)].copy()
-    fig2 = px.bar(d_plot, x="Gate", y="Valore", color="Giro", barmode="stack")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.metric("Totale Righe", f"{total_rows:,.0f}".replace(",", ".")) if "Righe" in available_metrics else st.metric("Totale Righe", "—")
+with c3:
+    st.metric("Totale Colli", f"{total_colli:,.0f}".replace(",", ".")) if "Colli" in available_metrics else st.metric("Totale Colli", "—")
 
-# ----------------------------
-# Compare Righe vs Colli (single view)
-# ----------------------------
-st.subheader("Confronto Righe vs Colli per Gate (stesso periodo/filtri)")
+# PIE: gate share
+pie_df = (fact_f[fact_f["Metrica"] == metric_for_pie]
+          .groupby("Gate", as_index=False)["Valore"].sum()
+          .sort_values("Valore", ascending=False))
+if pie_df["Valore"].sum() > 0:
+    fig_pie = px.pie(pie_df, names="Gate", values="Valore", title=f"Peso Gate sul totale ({metric_for_pie})")
+    st.plotly_chart(fig_pie, use_container_width=True)
+else:
+    st.info("Nessun dato nel periodo/filtri selezionati.")
 
-base = fact[
-    (fact["Giro"].isin(sel_giri)) &
-    (fact["Gate"].isin(sel_gates)) &
-    (fact["Data"].between(start_ts, end_ts) | fact["Data"].isna())
-].copy()
+# Stacked bar Gate->Giro
+st.subheader(f"Dettaglio Gate → Giri ({metric_for_pie})")
+bar_df = fact_f[fact_f["Metrica"] == metric_for_pie].groupby(["Gate", "Giro"], as_index=False)["Valore"].sum()
+if len(bar_df):
+    fig_bar = px.bar(bar_df, x="Gate", y="Valore", color="Giro", title="Carico per Gate con dettaglio giri", barmode="stack")
+    st.plotly_chart(fig_bar, use_container_width=True)
+else:
+    st.info("Nessun dato per l'istogramma.")
 
-cmp = (
-    base[base["Data"].notna()]
-    .groupby(["Gate", "Metrica"], as_index=False)["Valore"].sum()
-)
-cmp_piv = cmp.pivot_table(index="Gate", columns="Metrica", values="Valore", aggfunc="sum").fillna(0).reset_index()
-if "Righe" not in cmp_piv.columns: cmp_piv["Righe"] = 0.0
-if "Colli" not in cmp_piv.columns: cmp_piv["Colli"] = 0.0
-cmp_piv["Colli/100 righe"] = np.where(cmp_piv["Righe"] > 0, cmp_piv["Colli"] / cmp_piv["Righe"] * 100, np.nan)
+# Righe vs Colli dashboard
+st.subheader("Confronto Righe vs Colli per Gate")
+compare_df = fact_f.groupby(["Gate", "Metrica"], as_index=False)["Valore"].sum()
+fig_cmp = px.bar(compare_df, x="Gate", y="Valore", color="Metrica", barmode="group", title="Righe vs Colli per Gate")
+st.plotly_chart(fig_cmp, use_container_width=True)
 
-fig3 = px.bar(
-    cmp_piv.sort_values("Righe", ascending=False),
-    x="Gate",
-    y=["Righe", "Colli"],
-    barmode="group"
-)
-st.plotly_chart(fig3, use_container_width=True)
-st.dataframe(cmp_piv.sort_values("Righe", ascending=False), use_container_width=True)
+# Ratio table if both present
+if ("Righe" in available_metrics) and ("Colli" in available_metrics):
+    piv = compare_df.pivot(index="Gate", columns="Metrica", values="Valore").fillna(0.0).reset_index()
+    piv["Colli_per_100_righe"] = np.where(piv["Righe"] > 0, (piv["Colli"] / piv["Righe"]) * 100, np.nan)
+    st.dataframe(piv.sort_values("Righe", ascending=False), use_container_width=True)
 
-# ----------------------------
-# Top Giri per Gate
-# ----------------------------
-st.subheader("Top giri per Gate (dettaglio)")
-sel_gate_detail = st.selectbox("Seleziona Gate", options=sorted(gate_tot["Gate"].unique().tolist()))
-top = (
-    f[(f["Data"].notna()) & (f["Gate"] == sel_gate_detail)]
-    .groupby("Giro", as_index=False)["Valore"].sum()
-    .sort_values("Valore", ascending=False)
-    .head(top_n)
-)
-fig4 = px.bar(top, x="Giro", y="Valore")
-st.plotly_chart(fig4, use_container_width=True)
+# Top giri per Gate
+st.subheader("Top Giri per Gate")
+gate_sel = st.selectbox("Scegli Gate", options=sorted(fact_f["Gate"].unique().tolist()))
+top_df = (fact_f[fact_f["Gate"] == gate_sel]
+          .groupby(["Giro", "Metrica"], as_index=False)["Valore"].sum())
 
-csv = top.to_csv(index=False).encode("utf-8")
-st.download_button("Scarica CSV (Top giri)", data=csv, file_name=f"top_giri_{sel_gate_detail}_{metric_view}.csv", mime="text/csv")
+# show both metrics if present, otherwise just one
+if len(top_df):
+    # rank by selected metric if present else first available
+    rank_metric = metric_for_pie if metric_for_pie in available_metrics else available_metrics[0]
+    rank = (top_df[top_df["Metrica"] == rank_metric]
+            .sort_values("Valore", ascending=False)
+            .head(topn)[["Giro", "Valore"]])
+    st.write(f"Top {topn} giri per Gate **{gate_sel}** (ordinati per {rank_metric})")
+    st.dataframe(rank, use_container_width=True)
 
-# ----------------------------
+    fig_top = px.bar(rank, x="Giro", y="Valore", title=f"Top giri ({rank_metric}) - {gate_sel}")
+    st.plotly_chart(fig_top, use_container_width=True)
+
+    # export CSV
+    csv_bytes = rank.to_csv(index=False).encode("utf-8")
+    st.download_button("Scarica CSV Top giri", data=csv_bytes, file_name=f"top_giri_{gate_sel}.csv", mime="text/csv")
+else:
+    st.info("Nessun dato per Top Giri.")
+
 # Trend giornaliero per Gate
-# ----------------------------
 st.subheader("Trend giornaliero per Gate")
-trend = (
-    f[f["Data"].notna()]
-    .assign(Giorno=lambda x: x["Data"].dt.normalize())
-    .groupby(["Giorno", "Gate"], as_index=False)["Valore"].sum()
-)
+metric_trend = st.selectbox("Metrica per trend", options=available_metrics, key="metric_trend")
+trend_df = (fact_f[fact_f["Metrica"] == metric_trend]
+            .groupby(["Data", "Gate"], as_index=False)["Valore"].sum())
+if len(trend_df):
+    fig_trend = px.line(trend_df, x="Data", y="Valore", color="Gate", title=f"Trend giornaliero ({metric_trend})")
+    st.plotly_chart(fig_trend, use_container_width=True)
+else:
+    st.info("Nessun dato per trend.")
 
-sel_gates_trend = st.multiselect("Gate da mostrare nel trend", options=sorted(trend["Gate"].unique()), default=sorted(trend["Gate"].unique())[:5])
-trend2 = trend[trend["Gate"].isin(sel_gates_trend)].copy()
-fig5 = px.line(trend2, x="Giorno", y="Valore", color="Gate", markers=True)
-st.plotly_chart(fig5, use_container_width=True)
-
-# ----------------------------
 # Alerts
-# ----------------------------
-st.subheader("Alert")
+st.subheader("🚨 Alert")
 alerts = []
 
-# Gate share alert (based on selected metric_view)
-bad_share = gate_tot[gate_tot["Perc"] > thr_gate]
-if not bad_share.empty:
-    alerts.append(("Gate dominanti", bad_share[["Gate", "Perc", "Valore"]]))
+# Gate share alert (on selected main metric)
+tot_metric = fact_f.loc[fact_f["Metrica"] == metric_for_pie, "Valore"].sum()
+if tot_metric > 0:
+    share = (fact_f[fact_f["Metrica"] == metric_for_pie]
+             .groupby("Gate", as_index=False)["Valore"].sum())
+    share["pct"] = (share["Valore"] / tot_metric) * 100
+    over = share[share["pct"] >= alert_gate_pct].sort_values("pct", ascending=False)
+    for _, r in over.iterrows():
+        alerts.append(f"Gate {r['Gate']} pesa {r['pct']:.1f}% del totale {metric_for_pie} (soglia {alert_gate_pct}%).")
 
-# Colli/100 righe alert
-bad_ratio = cmp_piv[cmp_piv["Colli/100 righe"] > thr_ratio].copy()
-if not bad_ratio.empty:
-    alerts.append(("Rapporto colli/righe alto", bad_ratio[["Gate", "Colli/100 righe", "Righe", "Colli"]]))
+# Colli/100 righe anomaly
+if ("Righe" in available_metrics) and ("Colli" in available_metrics):
+    cmp = compare_df.pivot(index="Gate", columns="Metrica", values="Valore").fillna(0.0)
+    cmp["ratio"] = np.where(cmp["Righe"] > 0, (cmp["Colli"] / cmp["Righe"]) * 100, np.nan)
+    anom = cmp[cmp["ratio"] >= alert_ratio].sort_values("ratio", ascending=False)
+    for gate, row in anom.iterrows():
+        alerts.append(f"Gate {gate}: Colli/100 righe = {row['ratio']:.1f} (soglia {alert_ratio}).")
 
-if not alerts:
-    st.success("Nessun alert per le soglie impostate.")
+if alerts:
+    for a in alerts:
+        st.warning(a)
 else:
-    for title, df_a in alerts:
-        st.warning(title)
-        st.dataframe(df_a, use_container_width=True)
+    st.success("Nessun alert nel periodo/filtri selezionati.")
