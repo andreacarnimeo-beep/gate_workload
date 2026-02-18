@@ -160,18 +160,35 @@ def fmt_int(x: float) -> str:
 # UI
 # -------------------------
 
+
 def parse_period_widget(min_d, max_d):
     """
     Robust date selector:
-    - If dataset contains a single day (min==max), show single-date picker.
-    - Otherwise show range picker, but also handle single-date return (start=end).
+    - Supports single-day analysis (start=end).
+    - Handles Streamlit returning:
+        * a single date
+        * a (start, end) tuple
+        * (start, None) while user is still selecting
+        * [date] list (some builds)
     """
+    # If dataset contains a single day, show a single-date picker
     if min_d == max_d:
         d = st.sidebar.date_input("Periodo", value=min_d, min_value=min_d, max_value=max_d)
         return d, d
+
     period = st.sidebar.date_input("Periodo", value=(min_d, max_d), min_value=min_d, max_value=max_d)
-    if isinstance(period, (list, tuple)) and len(period) == 2:
-        return period[0], period[1]
+
+    # Case: tuple/list
+    if isinstance(period, (list, tuple)):
+        if len(period) == 2:
+            start, end = period[0], period[1]
+            if end is None:
+                end = start
+            return start, end
+        if len(period) == 1:
+            return period[0], period[0]
+
+    # Case: single date
     return period, period
 
 st.title("Gate Workload • EasyMag")
