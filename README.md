@@ -1,18 +1,9 @@
-# Gate Workload • EasyMag (single-file)
+# Gate Workload • EasyMag (single-file v1.6)
 
-App Streamlit single-file per analizzare carico di lavoro per Gate (righe prelevate e/o colli creati) a partire da export EasyMag in formato pivot.
+## Novità
+- Se l'app trova giri senza Gate, **ti obbliga** ad assegnarli a un Gate prima di continuare.
+- Nessuna modifica agli Excel: le assegnazioni sono solo in-sessione (app).
 
-## File richiesti
-- **Obbligatorio:** `GATE.xlsx` (mapping Giro -> Gate; Giro in colonna B, Gate in colonna J)
-- **Opzionale:** 1 o 2 export EasyMag (`.xlsx`):
-  - puoi caricare solo **Righe** oppure solo **Colli** oppure entrambi
-  - l'app tronca automaticamente la seconda tabella duplicata dopo la riga `(*) Numero di Operazioni`
-
-## Run locale
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Deploy Streamlit Cloud
-- Main file path: `app.py`
+## File
+- Obbligatorio: GATE.xlsx (Giro colonna B, Gate colonna J)
+- Opzionali: 1-2 export EasyMag (Righe/Colli)
