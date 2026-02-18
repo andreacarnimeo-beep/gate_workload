@@ -1,9 +1,11 @@
-# Gate Workload • EasyMag (single-file v1.6)
+# Gate Workload • EasyMag (single-file v1.7)
 
-## Novità
-- Se l'app trova giri senza Gate, **ti obbliga** ad assegnarli a un Gate prima di continuare.
-- Nessuna modifica agli Excel: le assegnazioni sono solo in-sessione (app).
+Fix principali:
+- Eliminati TUTTI i ternary con `st.metric(...) if ... else ...` (causavano stampa di testo/DeltaGenerator in alcune build).
+- Normalizzazione Giro robusta (es: 99.0 -> 99).
+- Esclusione colonne Tot/Tot: come "giro" (evita doppio conteggio e falsi missing).
+- Se esistono giri senza Gate, l'app si blocca e ti obbliga ad assegnarli.
 
-## File
-- Obbligatorio: GATE.xlsx (Giro colonna B, Gate colonna J)
-- Opzionali: 1-2 export EasyMag (Righe/Colli)
+File:
+- Obbligatorio: GATE.xlsx
+- Opzionali: 1-2 export EasyMag (righe/colli)
