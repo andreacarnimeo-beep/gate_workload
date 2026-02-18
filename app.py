@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import re
-from datetime import datetime
 from io import BytesIO
 
 st.set_page_config(page_title="Gate Workload • EasyMag", layout="wide")
@@ -93,17 +92,12 @@ def parse_easymag_pivot(file_bytes: bytes) -> pd.DataFrame:
     long = long.dropna(subset=["Data"])
     return long[["Data", "Giro", "Valore", "Giro_raw"]]
 
-def infer_metric_label(filename: str, total_val: float) -> str:
-    """
-    Infer whether file is Righe or Colli from filename.
-    If unknown, caller may still map it manually in UI.
-    """
+def infer_metric_label(filename: str) -> str:
     name = (filename or "").lower()
     if any(k in name for k in ["riga", "righe", "preliev"]):
         return "Righe"
     if any(k in name for k in ["collo", "colli"]):
         return "Colli"
-    # ambiguous
     return "Auto"
 
 def build_gate_map(gate_file_bytes: bytes) -> pd.DataFrame:
@@ -113,12 +107,10 @@ def build_gate_map(gate_file_bytes: bytes) -> pd.DataFrame:
       - Gate in colonna J
     """
     gate_raw = pd.read_excel(BytesIO(gate_file_bytes), engine="openpyxl")
-    # Defensive: use positional columns if present
     if gate_raw.shape[1] >= 10:
         giro_col = gate_raw.columns[1]   # B
         gate_col = gate_raw.columns[9]   # J
     else:
-        # fallback: try by name
         candidates_giro = [c for c in gate_raw.columns if str(c).strip().lower() in ["giro", "giri", "tour"]]
         candidates_gate = [c for c in gate_raw.columns if "gate" in str(c).strip().lower()]
         giro_col = candidates_giro[0] if candidates_giro else gate_raw.columns[0]
@@ -142,6 +134,12 @@ def merge_with_gate(long_df: pd.DataFrame, gate_map: pd.DataFrame, metric: str) 
     fact["Gate"] = fact["Gate"].fillna("NON ASSEGNATO")
     return fact
 
+def fmt_int(x: float) -> str:
+    try:
+        return f"{x:,.0f}".replace(",", ".")
+    except Exception:
+        return "—"
+
 # -------------------------
 # UI
 # -------------------------
@@ -160,23 +158,20 @@ if gate_file is None:
 
 gate_map = build_gate_map(gate_file.getvalue())
 
-# Parse available exports
 exports = []
 for f in [file1, file2]:
     if f is None:
         continue
     long_df = parse_easymag_pivot(f.getvalue())
-    label = infer_metric_label(getattr(f, "name", ""), float(long_df["Valore"].sum()))
+    label = infer_metric_label(getattr(f, "name", ""))
     exports.append({"file": f, "long": long_df, "label": label})
 
 if len(exports) == 0:
     st.warning("Hai caricato solo GATE.xlsx. Carica almeno **un** export EasyMag (righe o colli) per vedere i grafici.")
-    # Mostra comunque diagnostica mapping
     st.subheader("Diagnostica mapping GATE")
-    st.dataframe(gate_map.head(50))
+    st.dataframe(gate_map.head(50), use_container_width=True)
     st.stop()
 
-# If ambiguous, let user assign metrics
 st.sidebar.header("2) Assegnazione file (se serve)")
 for i, ex in enumerate(exports, start=1):
     default = ex["label"]
@@ -189,26 +184,19 @@ for i, ex in enumerate(exports, start=1):
         key=f"metric_{i}"
     )
 
-# If user accidentally assigns both as same metric, allow but warn and keep the latest one
 metrics_assigned = [ex["metric"] for ex in exports]
 if len(metrics_assigned) == 2 and metrics_assigned[0] == metrics_assigned[1]:
     st.sidebar.warning("Hai assegnato entrambi i file alla stessa metrica. Verranno sommati come un unico dataset.")
 
-# Build unified fact
 facts = [merge_with_gate(ex["long"], gate_map, ex["metric"]) for ex in exports]
 fact = pd.concat(facts, ignore_index=True)
 
-# -------------------------
-# Diagnostics for "NON ASSEGNATO"
-# -------------------------
 with st.expander("🔎 Diagnostica: perché vedo 'NON ASSEGNATO'? (click)"):
     st.write("L'app normalizza automaticamente i giri (spazi, maiuscole, numeri/testo). 'NON ASSEGNATO' resta solo se il giro non è presente nel mapping.")
-    assigned = fact[fact["Gate"] != "NON ASSEGNATO"]["Valore"].sum()
-    unassigned = fact[fact["Gate"] == "NON ASSEGNATO"]["Valore"].sum()
     total = fact["Valore"].sum()
+    unassigned = fact.loc[fact["Gate"] == "NON ASSEGNATO", "Valore"].sum()
     if total > 0:
-        st.metric("Quota NON ASSEGNATO", f"{unassigned/total:.1%}")
-    # list missing giri
+        st.metric("Quota NON ASSEGNATO", f"{(unassigned/total):.1%}")
     missing_giri = fact.loc[fact["Gate"] == "NON ASSEGNATO", ["Giro_raw", "Giro"]].drop_duplicates().sort_values("Giro")
     st.write("Giri presenti negli export ma senza Gate nel mapping:")
     st.dataframe(missing_giri, use_container_width=True)
@@ -219,11 +207,12 @@ with st.expander("🔎 Diagnostica: perché vedo 'NON ASSEGNATO'? (click)"):
 st.sidebar.header("3) Filtri")
 min_d = fact["Data"].min().date()
 max_d = fact["Data"].max().date()
-start_d, end_d = st.sidebar.date_input("Periodo", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+period = st.sidebar.date_input("Periodo", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+if isinstance(period, (list, tuple)):
+    start_d, end_d = period
+else:
+    start_d, end_d = min_d, max_d
 
-if isinstance(start_d, (list, tuple)):
-    # streamlit may return tuple
-    start_d, end_d = start_d
 start_dt = pd.to_datetime(start_d)
 end_dt = pd.to_datetime(end_d) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
@@ -231,80 +220,80 @@ fact_f = fact[(fact["Data"] >= start_dt) & (fact["Data"] <= end_dt)].copy()
 
 all_gates = sorted(fact_f["Gate"].unique().tolist())
 sel_gates = st.sidebar.multiselect("Solo Gate selezionati", options=all_gates, default=all_gates)
-
 fact_f = fact_f[fact_f["Gate"].isin(sel_gates)]
 
 all_giri = sorted(fact_f["Giro"].unique().tolist())
 sel_giri = st.sidebar.multiselect("Solo Giri selezionati", options=all_giri, default=all_giri)
-
 fact_f = fact_f[fact_f["Giro"].isin(sel_giri)]
 
-# Settings
 topn = st.sidebar.slider("Top N giri (vista dettaglio)", 5, 50, 15)
 alert_gate_pct = st.sidebar.slider("Alert: Gate > X% del totale", 5, 90, 40)
 alert_ratio = st.sidebar.slider("Alert: Colli/100 righe > soglia", 10, 300, 120)
 
-# Metric selector based on available
 available_metrics = sorted(fact_f["Metrica"].unique().tolist())
-metric_for_pie = st.selectbox("Metrica per grafici principali", options=available_metrics, index=0)
+metric_for_main = st.selectbox("Metrica per grafici principali", options=available_metrics, index=0)
 
 # -------------------------
-# Dashboard layout
+# KPI cards (FIX: no ternary rendering)
 # -------------------------
 c1, c2, c3 = st.columns([1, 1, 1])
 
-total_val = fact_f.loc[fact_f["Metrica"] == metric_for_pie, "Valore"].sum()
+total_main = fact_f.loc[fact_f["Metrica"] == metric_for_main, "Valore"].sum()
 total_rows = fact_f.loc[fact_f["Metrica"] == "Righe", "Valore"].sum() if "Righe" in available_metrics else 0.0
 total_colli = fact_f.loc[fact_f["Metrica"] == "Colli", "Valore"].sum() if "Colli" in available_metrics else 0.0
 
 with c1:
-    st.metric(f"Totale {metric_for_pie}", f"{total_val:,.0f}".replace(",", "."))
+    st.metric(f"Totale {metric_for_main}", fmt_int(total_main))
 with c2:
-    st.metric("Totale Righe", f"{total_rows:,.0f}".replace(",", ".")) if "Righe" in available_metrics else st.metric("Totale Righe", "—")
+    if "Righe" in available_metrics:
+        st.metric("Totale Righe", fmt_int(total_rows))
+    else:
+        st.metric("Totale Righe", "—")
 with c3:
-    st.metric("Totale Colli", f"{total_colli:,.0f}".replace(",", ".")) if "Colli" in available_metrics else st.metric("Totale Colli", "—")
+    if "Colli" in available_metrics:
+        st.metric("Totale Colli", fmt_int(total_colli))
+    else:
+        st.metric("Totale Colli", "—")
 
-# PIE: gate share
-pie_df = (fact_f[fact_f["Metrica"] == metric_for_pie]
+# -------------------------
+# Charts
+# -------------------------
+pie_df = (fact_f[fact_f["Metrica"] == metric_for_main]
           .groupby("Gate", as_index=False)["Valore"].sum()
           .sort_values("Valore", ascending=False))
+
 if pie_df["Valore"].sum() > 0:
-    fig_pie = px.pie(pie_df, names="Gate", values="Valore", title=f"Peso Gate sul totale ({metric_for_pie})")
+    fig_pie = px.pie(pie_df, names="Gate", values="Valore", title=f"Peso Gate sul totale ({metric_for_main})")
     st.plotly_chart(fig_pie, use_container_width=True)
 else:
     st.info("Nessun dato nel periodo/filtri selezionati.")
+    st.stop()
 
-# Stacked bar Gate->Giro
-st.subheader(f"Dettaglio Gate → Giri ({metric_for_pie})")
-bar_df = fact_f[fact_f["Metrica"] == metric_for_pie].groupby(["Gate", "Giro"], as_index=False)["Valore"].sum()
+st.subheader(f"Dettaglio Gate → Giri ({metric_for_main})")
+bar_df = fact_f[fact_f["Metrica"] == metric_for_main].groupby(["Gate", "Giro"], as_index=False)["Valore"].sum()
 if len(bar_df):
     fig_bar = px.bar(bar_df, x="Gate", y="Valore", color="Giro", title="Carico per Gate con dettaglio giri", barmode="stack")
     st.plotly_chart(fig_bar, use_container_width=True)
 else:
     st.info("Nessun dato per l'istogramma.")
 
-# Righe vs Colli dashboard
 st.subheader("Confronto Righe vs Colli per Gate")
 compare_df = fact_f.groupby(["Gate", "Metrica"], as_index=False)["Valore"].sum()
 fig_cmp = px.bar(compare_df, x="Gate", y="Valore", color="Metrica", barmode="group", title="Righe vs Colli per Gate")
 st.plotly_chart(fig_cmp, use_container_width=True)
 
-# Ratio table if both present
 if ("Righe" in available_metrics) and ("Colli" in available_metrics):
     piv = compare_df.pivot(index="Gate", columns="Metrica", values="Valore").fillna(0.0).reset_index()
     piv["Colli_per_100_righe"] = np.where(piv["Righe"] > 0, (piv["Colli"] / piv["Righe"]) * 100, np.nan)
     st.dataframe(piv.sort_values("Righe", ascending=False), use_container_width=True)
 
-# Top giri per Gate
 st.subheader("Top Giri per Gate")
 gate_sel = st.selectbox("Scegli Gate", options=sorted(fact_f["Gate"].unique().tolist()))
 top_df = (fact_f[fact_f["Gate"] == gate_sel]
           .groupby(["Giro", "Metrica"], as_index=False)["Valore"].sum())
 
-# show both metrics if present, otherwise just one
 if len(top_df):
-    # rank by selected metric if present else first available
-    rank_metric = metric_for_pie if metric_for_pie in available_metrics else available_metrics[0]
+    rank_metric = metric_for_main if metric_for_main in available_metrics else available_metrics[0]
     rank = (top_df[top_df["Metrica"] == rank_metric]
             .sort_values("Valore", ascending=False)
             .head(topn)[["Giro", "Valore"]])
@@ -314,13 +303,11 @@ if len(top_df):
     fig_top = px.bar(rank, x="Giro", y="Valore", title=f"Top giri ({rank_metric}) - {gate_sel}")
     st.plotly_chart(fig_top, use_container_width=True)
 
-    # export CSV
     csv_bytes = rank.to_csv(index=False).encode("utf-8")
     st.download_button("Scarica CSV Top giri", data=csv_bytes, file_name=f"top_giri_{gate_sel}.csv", mime="text/csv")
 else:
     st.info("Nessun dato per Top Giri.")
 
-# Trend giornaliero per Gate
 st.subheader("Trend giornaliero per Gate")
 metric_trend = st.selectbox("Metrica per trend", options=available_metrics, key="metric_trend")
 trend_df = (fact_f[fact_f["Metrica"] == metric_trend]
@@ -331,21 +318,18 @@ if len(trend_df):
 else:
     st.info("Nessun dato per trend.")
 
-# Alerts
 st.subheader("🚨 Alert")
 alerts = []
 
-# Gate share alert (on selected main metric)
-tot_metric = fact_f.loc[fact_f["Metrica"] == metric_for_pie, "Valore"].sum()
+tot_metric = fact_f.loc[fact_f["Metrica"] == metric_for_main, "Valore"].sum()
 if tot_metric > 0:
-    share = (fact_f[fact_f["Metrica"] == metric_for_pie]
+    share = (fact_f[fact_f["Metrica"] == metric_for_main]
              .groupby("Gate", as_index=False)["Valore"].sum())
     share["pct"] = (share["Valore"] / tot_metric) * 100
     over = share[share["pct"] >= alert_gate_pct].sort_values("pct", ascending=False)
     for _, r in over.iterrows():
-        alerts.append(f"Gate {r['Gate']} pesa {r['pct']:.1f}% del totale {metric_for_pie} (soglia {alert_gate_pct}%).")
+        alerts.append(f"Gate {r['Gate']} pesa {r['pct']:.1f}% del totale {metric_for_main} (soglia {alert_gate_pct}%).")
 
-# Colli/100 righe anomaly
 if ("Righe" in available_metrics) and ("Colli" in available_metrics):
     cmp = compare_df.pivot(index="Gate", columns="Metrica", values="Valore").fillna(0.0)
     cmp["ratio"] = np.where(cmp["Righe"] > 0, (cmp["Colli"] / cmp["Righe"]) * 100, np.nan)
