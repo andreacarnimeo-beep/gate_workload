@@ -1,8 +1,16 @@
-# Gate Workload STABLE v1
+# Gate Workload • EasyMag (single-file v1.7)
 
-Versione stabilizzata:
-- Supporta analisi su un solo giorno
-- Auto-detect Prelievi (Righe) tramite header
-- Esclude colonne Tot
-- Normalizza giro 99.0 -> 99
-- Blocca se esistono giri senza Gate
+Fix principali:
+- Eliminati TUTTI i ternary con `st.metric(...) if ... else ...` (causavano stampa di testo/DeltaGenerator in alcune build).
+- Normalizzazione Giro robusta (es: 99.0 -> 99).
+- Esclusione colonne Tot/Tot: come "giro" (evita doppio conteggio e falsi missing).
+- Se esistono giri senza Gate, l'app si blocca e ti obbliga ad assegnarli.
+
+File:
+- Obbligatorio: GATE.xlsx
+- Opzionali: 1-2 export EasyMag (righe/colli)
+
+
+## Patch v1.7+ (v1.9)
+- Periodo: supporto selezione **1 solo giorno** (start=end) e dataset mono-giorno.
+- Auto-assegnazione report **Prelievi → Righe** cercando la riga `(*) Numero di Operazioni Prelievi` (keyword `preliev`).
